@@ -49,6 +49,17 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+fn to_digits(mut v: u64) -> Vec<u8> {
+    let mut digits: Vec<u8> = Vec::with_capacity(20);
+
+    while v > 0 {
+        let n = (v % 10) as u8;
+        v /= 10;
+        digits.push(n);
+    }
+    digits
+}
+
 pub(crate) async fn beacon_handler(event: Request, _ctx: Context) -> Result<Response, Error> {
 
     // exhibit some S3 file content getting
@@ -96,8 +107,12 @@ pub(crate) async fn beacon_handler(event: Request, _ctx: Context) -> Result<Resp
 
     // prepare the response
     // do some random result generation (to be removed and replaced with REAL bioinformatics)
+    let digits = to_digits(event.start);
+    let left_digit = digits.last().copied().unwrap();
+    let left_digit_str = vec![left_digit + 48];
+
     let resp = Response {
-        found: event.vcf_key.contains("1")
+        found: event.vcf_key.contains(std::str::from_utf8(&left_digit_str).unwrap())
     };
 
     // return `Response` (it will be serialized to JSON automatically by the runtime)
@@ -155,4 +170,23 @@ mod tests {
 
         assert!(!r.unwrap().found, "Unexpected variant was found");
     }
+
+    // this test should be deleted once the real bioinformatics is in
+    // this one just tests our stupid 'random' logic
+    #[tokio::test]
+    async fn test_random_logic_with_leading_nine() {
+        let r = beacon_handler(Request {
+            vcf_bucket: "umccr-10g-data-dev".to_string(),
+            vcf_key: "HG00096/HG00096.hard-filtered.vcf.gz".to_string(),
+            vcf_index_bucket: "umccr-10g-data-dev".to_string(),
+            vcf_index_key: "HG00096/HG00096.hard-filtered.vcf.gz.tbi".to_string(),
+            reference_name: "chrX".to_string(),
+            start: 9220751,
+            reference_bases: "A".to_string(),
+            alternate_bases: "A".to_string(),
+        }, Context::default()).await;
+
+        assert!(r.unwrap().found, "Leading 9 in start meant that this path should match");
+    }
+
 }
