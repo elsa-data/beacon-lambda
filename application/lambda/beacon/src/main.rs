@@ -1,10 +1,24 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use lambda_runtime::{handler_fn, Context, Error};
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
 use simple_logger::SimpleLogger;
 use aws_sdk_s3::Client;
+use futures::stream::FuturesUnordered;
+use futures::{StreamExt, TryStreamExt};
+use htsget_search::htsget::Format;
+use htsget_search::htsget::search::{BgzfSearch, Search};
+use htsget_search::RegexResolver;
+use htsget_search::storage::{BytesPosition, BytesRange};
+use htsget_search::StorageType::AwsS3Storage;
+use noodles::core::Position;
+use noodles::csi::{BinningIndex, BinningIndexReferenceSequence};
+use noodles::vcf::header::Header;
+use noodles_vcf::AsyncReader;
+use tokio::select;
 use tokio::time::{sleep, Duration};
 
 // See http://docs.genomebeacons.org/variant-queries/
@@ -22,7 +36,7 @@ struct Request {
     // this is only set up for beacon sequence queries.. we need to think
     // about a better model for dynamic/range etc queries
     reference_name: String,
-    start: u64,
+    start: u32,
     reference_bases: String,
     alternate_bases: String,
 }
@@ -61,8 +75,6 @@ fn to_digits(mut v: u64) -> Vec<u8> {
 }
 
 pub(crate) async fn beacon_handler(event: Request, _ctx: Context) -> Result<Response, Error> {
-
-    // exhibit some S3 file content getting
     let client = Client::new(&aws_config::load_from_env().await);
 
     let response = client
@@ -70,10 +82,42 @@ pub(crate) async fn beacon_handler(event: Request, _ctx: Context) -> Result<Resp
         .bucket(&event.vcf_index_bucket)
         .key(&event.vcf_index_key)
         .send()
-        .await
-        .unwrap();
+        .await?;
 
-    println!("{}", response.content_length());
+    let index = noodles::tabix::AsyncReader::new(response.body.into_async_read()).read_index().await?;
+    let query = htsget_search::htsget::Query::new(event.vcf_key, Format::Vcf).with_start(event.start);
+    let storage = htsget_search::storage::aws::AwsS3Storage::new(client, event.vcf_index_bucket, RegexResolver::default());
+    let vcf_search = htsget_search::htsget::vcf_search::VcfSearch::new(Arc::new(storage));
+    let byte_ranges = vcf_search.get_byte_ranges_for_reference_name(event.reference_name, &index, &Header::default(), query).await?;
+
+    let mut blocks = FuturesUnordered::new();
+    for range in BytesPosition::merge_all(byte_ranges).iter().map(BytesRange::from) {
+        blocks.push(tokio::spawn(async move {
+            client.get_object().bucket(&event.vcf_bucket).key(&event.vcf_key).range(String::from(range)).send().await
+        }));
+    };
+
+    let body = blocks.next().await.unwrap().unwrap().unwrap().body;
+    let mut vcf_block = AsyncReader::new(body.into_async_read());
+    let mut records = vcf_block.records(&header);
+    while let Some(record) = records.try_next().await? {
+        if record.reference_bases() == event.reference_bases.parse()? && record.alternate_bases() == event.alternate_bases.parse()? {
+            return Ok(Response { found: true });
+        }
+    }
+
+    // loop {
+    //     select! {
+    //         Some(next) = blocks.next() => {
+    //             let a = next;
+    //         },
+    //         else => break
+    //     }
+    // }
+
+    // htsget_search::htsget::
+    // index.header().
+    // println!("{:?}", index);
 
     // do some tabix parsing so we can jump direct to the right spot in the VCF
     // I don't know if there is some clever way to hook up the tabix to stream the S3 index
@@ -99,24 +143,54 @@ pub(crate) async fn beacon_handler(event: Request, _ctx: Context) -> Result<Resp
 
 
     // simulate variable runtime - different keys = different pauses (to be removed obviously)
-    let mut s = DefaultHasher::new();
-    event.vcf_key.hash(&mut s);
-    let h = s.finish();
-
-    sleep(Duration::from_secs(h % 10)).await;
-
-    // prepare the response
-    // do some random result generation (to be removed and replaced with REAL bioinformatics)
-    let digits = to_digits(event.start);
-    let left_digit = digits.last().copied().unwrap();
-    let left_digit_str = vec![left_digit + 48];
+    // let mut s = DefaultHasher::new();
+    // event.vcf_key.hash(&mut s);
+    // let h = s.finish();
+    //
+    // sleep(Duration::from_secs(h % 10)).await;
+    //
+    // // prepare the response
+    // // do some random result generation (to be removed and replaced with REAL bioinformatics)
+    // let digits = to_digits(event.start);
+    // let left_digit = digits.last().copied().unwrap();
+    // let left_digit_str = vec![left_digit + 48];
 
     let resp = Response {
-        found: event.vcf_key.contains(std::str::from_utf8(&left_digit_str).unwrap())
+        found: false
     };
 
     // return `Response` (it will be serialized to JSON automatically by the runtime)
     Ok(resp)
+}
+
+fn index_positions(index: &noodles::tabix::Index) -> Vec<u64> {
+    let mut positions = HashSet::new();
+
+    positions.extend(
+        index
+          .reference_sequences()
+          .iter()
+          .flat_map(|ref_seq| ref_seq.bins())
+          .flat_map(|bin| bin.chunks())
+          .flat_map(|chunk| [chunk.start().compressed(), chunk.end().compressed()]),
+    );
+    positions.extend(
+        index
+          .reference_sequences()
+          .iter()
+          .filter_map(|ref_seq| ref_seq.metadata())
+          .flat_map(|metadata| {
+              [
+                  metadata.start_position().compressed(),
+                  metadata.end_position().compressed(),
+              ]
+          }),
+    );
+
+    positions.remove(&0);
+    let mut positions: Vec<u64> = positions.into_iter().collect();
+    positions.sort_unstable();
+    positions
 }
 
 #[cfg(test)]
