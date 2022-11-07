@@ -10,14 +10,15 @@ use aws_sdk_s3::Client;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use htsget_search::htsget::Format;
-use htsget_search::htsget::search::{BgzfSearch, Search};
+use htsget_search::htsget::search::{BgzfSearch, Search, SearchAll};
 use htsget_search::RegexResolver;
 use htsget_search::storage::{BytesPosition, BytesRange};
 use htsget_search::StorageType::AwsS3Storage;
+use noodles::{bgzf, vcf};
 use noodles::core::Position;
 use noodles::csi::{BinningIndex, BinningIndexReferenceSequence};
 use noodles::vcf::header::Header;
-use noodles_vcf::AsyncReader;
+use noodles_vcf::record::{AlternateBases, ReferenceBases};
 use tokio::select;
 use tokio::time::{sleep, Duration};
 
@@ -85,23 +86,32 @@ pub(crate) async fn beacon_handler(event: Request, _ctx: Context) -> Result<Resp
         .await?;
 
     let index = noodles::tabix::AsyncReader::new(response.body.into_async_read()).read_index().await?;
-    let query = htsget_search::htsget::Query::new(event.vcf_key, Format::Vcf).with_start(event.start);
-    let storage = htsget_search::storage::aws::AwsS3Storage::new(client, event.vcf_index_bucket, RegexResolver::default());
+    let query = htsget_search::htsget::Query::new(&event.vcf_key, Format::Vcf).with_start(event.start);
+    let storage = htsget_search::storage::aws::AwsS3Storage::new(client.clone(), event.vcf_index_bucket, RegexResolver::default());
     let vcf_search = htsget_search::htsget::vcf_search::VcfSearch::new(Arc::new(storage));
-    let byte_ranges = vcf_search.get_byte_ranges_for_reference_name(event.reference_name, &index, &Header::default(), query).await?;
+
+    let header_bytes = vcf_search.get_byte_ranges_for_header(&index).await?;
+    let header = client.get_object().bucket(&event.vcf_bucket)
+      .key(&event.vcf_key).range(String::from(&BytesRange::from(&header_bytes))).send().await?.body;
+    let header: Header = vcf::AsyncReader::new(bgzf::AsyncReader::new(header.into_async_read())).read_header().await?.parse().unwrap();
+
+    let byte_ranges = vcf_search.get_byte_ranges_for_reference_name(event.reference_name, &index, &header, query).await?;
 
     let mut blocks = FuturesUnordered::new();
     for range in BytesPosition::merge_all(byte_ranges).iter().map(BytesRange::from) {
+        let client_owned = client.clone();
+        let bucket = event.vcf_bucket.clone();
+        let key = event.vcf_key.clone();
         blocks.push(tokio::spawn(async move {
-            client.get_object().bucket(&event.vcf_bucket).key(&event.vcf_key).range(String::from(range)).send().await
+            client_owned.get_object().bucket(bucket).key(key).range(String::from(&range)).send().await
         }));
     };
 
     let body = blocks.next().await.unwrap().unwrap().unwrap().body;
-    let mut vcf_block = AsyncReader::new(body.into_async_read());
+    let mut vcf_block = vcf::AsyncReader::new(bgzf::AsyncReader::new(body.into_async_read()));
     let mut records = vcf_block.records(&header);
     while let Some(record) = records.try_next().await? {
-        if record.reference_bases() == event.reference_bases.parse()? && record.alternate_bases() == event.alternate_bases.parse()? {
+        if record.reference_bases() == &event.reference_bases.parse::<ReferenceBases>().unwrap() && record.alternate_bases() == &event.alternate_bases.parse::<AlternateBases>().unwrap() {
             return Ok(Response { found: true });
         }
     }
