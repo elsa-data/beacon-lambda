@@ -4,23 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-lambda_runtime = "0.7"
-log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 serde = "1.0"
-simple_logger = "4.0"
 tokio = "1.21"
 futures = "0.3"
 
-# Noodles
-noodles = { version = "0.29", features = ["core", "bgzf", "bam", "bcf", "cram", "csi", "sam", "tabix", "vcf"] }
-noodles-bam = { version = "0.24", features = ["async"] }
-noodles-bcf = { version = "0.18", features = ["async"] }
-noodles-cram = { version = "0.21", features = ["async"] }
+noodles = { version = "0.29", features = ["bgzf", "tabix", "vcf"] }
 noodles-vcf = { version = "0.21", features = ["async"] }
 
 htsget-search = { git = "https://github.com/umccr/htsget-rs.git" }
 
-# Amazon S3
-bytes = { version = "1.2" }
+lambda_runtime = "0.7"
 aws-sdk-s3 = { version = "0.21" }
 aws-config = { version = "0.51" }
