@@ -76,6 +76,12 @@ fn to_digits(mut v: u64) -> Vec<u8> {
 }
 
 pub(crate) async fn beacon_handler(event: Request, _ctx: Context) -> Result<Response, Error> {
+    let vcf_index_key = if let Some(value) = event.vcf_index_key.strip_suffix(".vcf.gz.tbi") {
+        value.to_string()
+    } else {
+        event.vcf_index_key.to_string()
+    };
+
     let client = Client::new(&aws_config::load_from_env().await);
 
     let response = client
@@ -86,7 +92,7 @@ pub(crate) async fn beacon_handler(event: Request, _ctx: Context) -> Result<Resp
         .await?;
 
     let index = noodles::tabix::AsyncReader::new(response.body.into_async_read()).read_index().await?;
-    let query = htsget_search::htsget::Query::new(&event.vcf_key, Format::Vcf).with_start(event.start);
+    let query = htsget_search::htsget::Query::new(&vcf_index_key, Format::Vcf).with_start(event.start);
     let storage = htsget_search::storage::aws::AwsS3Storage::new(client.clone(), event.vcf_index_bucket, RegexResolver::default());
     let vcf_search = htsget_search::htsget::vcf_search::VcfSearch::new(Arc::new(storage));
 
@@ -107,23 +113,21 @@ pub(crate) async fn beacon_handler(event: Request, _ctx: Context) -> Result<Resp
         }));
     };
 
-    let body = blocks.next().await.unwrap().unwrap().unwrap().body;
-    let mut vcf_block = vcf::AsyncReader::new(bgzf::AsyncReader::new(body.into_async_read()));
-    let mut records = vcf_block.records(&header);
-    while let Some(record) = records.try_next().await? {
-        if record.reference_bases() == &event.reference_bases.parse::<ReferenceBases>().unwrap() && record.alternate_bases() == &event.alternate_bases.parse::<AlternateBases>().unwrap() {
-            return Ok(Response { found: true });
+    loop {
+        select! {
+            Some(next) = blocks.next() => {
+                    let body = next.unwrap().unwrap().body;
+                    let mut vcf_block = vcf::AsyncReader::new(bgzf::AsyncReader::new(body.into_async_read()));
+                    let mut records = vcf_block.records(&header);
+                    while let Some(record) = records.try_next().await? {
+                        if record.position() == vcf::record::Position::from(event.start as usize) && record.reference_bases() == &event.reference_bases.parse::<ReferenceBases>().unwrap() && record.alternate_bases() == &event.alternate_bases.parse::<AlternateBases>().unwrap() {
+                            return Ok(Response { found: true });
+                        }
+                    }
+            },
+            else => break
         }
     }
-
-    // loop {
-    //     select! {
-    //         Some(next) = blocks.next() => {
-    //             let a = next;
-    //         },
-    //         else => break
-    //     }
-    // }
 
     // htsget_search::htsget::
     // index.header().
