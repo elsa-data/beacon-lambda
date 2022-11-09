@@ -151,7 +151,14 @@ async fn beacon_sequence_query(
     let mut records = vcf_blocks.records(header);
 
     while let Some(record) = records.try_next().await? {
-        if record.position() == Position::from(usize::try_from(start)?)
+        let start = Position::from(usize::try_from(start)?);
+        let pos = record.position();
+
+        if pos > start {
+            return Ok(false);
+        }
+
+        if pos == start
             && record.reference_bases() == &reference_bases.parse::<ReferenceBases>()?
             && record.alternate_bases() == &alternate_bases.parse::<AlternateBases>()?
         {
